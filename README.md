@@ -97,7 +97,7 @@ Key changes include:
 
 ## Acknowledgements
 
-We sincerely thank the authors of [LiteGS](https://github.com/MooreThreads/LiteGS), [DashGaussian](https://github.com/dashgaussian/dashgaussian), and [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting) for their excellent open-source work, which forms the foundation of this project.
+We sincerely thank the authors of [LiteGS](https://github.com/MooreThreads/LiteGS), [DashGaussian](https://github.com/YouyuChen0207/DashGaussian), and [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting) for their excellent open-source work, which forms the foundation of this project.
 
 ## BibTeX
 
