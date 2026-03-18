@@ -1,4 +1,4 @@
-Copyright 2025 Jiaqi Liu, Zhizhong Han
+Copyright 2026 Jiaqi Liu, Zhizhong Han
 
 Redistribution and use in source and binary forms, with or without modification, are permitted for non-commercial academic research and/or non-commercial personal use only, provided that the following conditions are met:
 
