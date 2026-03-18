@@ -2,8 +2,11 @@
 
 Official implementation of **"Speeding Up the Learning of 3D Gaussians with Much Shorter Gaussian Lists"** (CVPR 2026).
 
+<p align="center">
+  <a href="https://arxiv.org/abs/2603.09277">Paper (arXiv 2603.09277)</a> | <a href="https://machineperceptionlab.github.io/ShorterSplatting-Project/">Project Page</a>
+</p>
 
-[![arXiv](https://img.shields.io/badge/arXiv-2603.09277-b31b1b)](https://arxiv.org/abs/2603.09277) [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://machineperceptionlab.github.io/ShorterSplatting-Project/)
+---
 
 ![Teaser](assets/teaser3.png)
 
