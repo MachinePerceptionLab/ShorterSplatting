@@ -1,5 +1,5 @@
 *.pyc
-output
+output*
 build
 *.egg-info
 dist
@@ -11,3 +11,4 @@ trace_*.json
 debug_gradient*
 profiler_input_data
 dataset/*
+.vscode/

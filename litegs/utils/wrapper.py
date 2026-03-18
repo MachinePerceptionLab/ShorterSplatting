@@ -445,32 +445,43 @@ class GaussiansRasterFunc(torch.autograd.Function):
         img_h:int,
         img_w:int,
         enable_transmitance:bool=False,
-        enable_depth:bool=False
+        enable_depth:bool=False,
+        enable_entropy:bool=False
     ):
         transmitance=None
         depth=None
+        entropy=None
         normal=None
 
-        img,transmitance,depth,lst_contributor=litegs_fused.rasterize_forward(sorted_pointId,tile_start_index,ndc,cov2d_inv,color,opacities,tiles,tile_size,img_h,img_w,enable_transmitance,enable_depth)
+        # The backward kernel reads final_transmitance unconditionally, so it must
+        # be stored whenever backward will run (not just when explicitly requested).
+        need_backward_aux = any(ctx.needs_input_grad[i] for i in (2, 3, 4, 5))
+        create_transmitance = enable_transmitance or need_backward_aux
+        img,transmitance,depth,entropy,lst_contributor=litegs_fused.rasterize_forward(
+            sorted_pointId,tile_start_index,ndc,cov2d_inv,color,opacities,tiles,
+            tile_size,img_h,img_w,create_transmitance,enable_depth,enable_entropy
+        )
+
         ctx.save_for_backward(sorted_pointId,tile_start_index,transmitance,lst_contributor,ndc,cov2d_inv,color,opacities,tiles)
         ctx.arg_tile_size=tile_size
         ctx.img_hw=(img_h,img_w)
-        
         if enable_depth==False:
             depth=None
         if enable_transmitance==False:
             transmitance=None
-        return img,transmitance,depth,normal
-    
+        if enable_entropy==False:
+            entropy=None
+        return img,transmitance,depth,entropy,normal
+
     @staticmethod
-    def backward(ctx, grad_rgb_image:torch.Tensor, grad_transmitance_image:torch.Tensor,grad_depth_image:torch.Tensor,grad_normal_image:torch.Tensor):
+    def backward(ctx, grad_rgb_image:torch.Tensor, grad_transmitance_image:torch.Tensor,grad_depth_image:torch.Tensor,grad_entropy_image:torch.Tensor,grad_normal_image:torch.Tensor):
         sorted_pointId,tile_start_index,transmitance,lst_contributor,ndc,cov2d_inv,color,opacities,tiles=ctx.saved_tensors
         (img_h,img_w)=ctx.img_hw
         tile_size=ctx.arg_tile_size
 
         grad_ndc,grad_cov2d_inv,grad_color,grad_opacities=litegs_fused.rasterize_backward(sorted_pointId,tile_start_index,ndc,cov2d_inv,color,opacities,tiles,
                                                                                                         transmitance,lst_contributor,
-                                                                                                        grad_rgb_image,grad_transmitance_image,grad_depth_image,
+                                                                                                        grad_rgb_image,grad_transmitance_image,grad_depth_image,grad_entropy_image,
                                                                                                         tile_size,img_h,img_w)
 
         grads = (
@@ -582,7 +593,7 @@ class Binning(BaseWrapper):
         def craete_2d_AABB(ndc:torch.Tensor,eigen_val:torch.Tensor,eigen_vec:torch.Tensor,opacity:torch.Tensor,tile_size:int,img_pixel_shape:tuple[int,int],img_tile_shape:tuple[int,int]):
             # Major and minor axes -> AABB extensions
             opacity_clamped=opacity.unsqueeze(0).clamp_min(1/255)
-            coefficient=2*((255*opacity_clamped).log())#-2*(1/(255*opacity.squeeze(-1))).log()
+            coefficient=2*((255*opacity_clamped).log())
             axis_length=(coefficient*eigen_val.abs()).sqrt()
             extension=(axis_length.unsqueeze(-2)*eigen_vec).abs().sum(dim=-3)
 
@@ -640,7 +651,7 @@ class Binning(BaseWrapper):
     @torch.no_grad()
     def __binning_fused(ndc:torch.Tensor,eigen_val:torch.Tensor,eigen_vec:torch.Tensor,opacity:torch.Tensor,
             img_pixel_shape:tuple[int,int],tile_size:int):
-        
+
         img_tile_shape=(int(math.ceil(img_pixel_shape[0]/float(tile_size))),int(math.ceil(img_pixel_shape[1]/float(tile_size))))
         tiles_num=img_tile_shape[0]*img_tile_shape[1]
 
@@ -652,7 +663,8 @@ class Binning(BaseWrapper):
         if StatisticsHelperInst.bStart:
             StatisticsHelperInst.update_max_min_compact('radii',rect_length.max(dim=1).values.float())
 
-        #sort by depth
+        # Inverse-z convention: ndc.z is near->1, far->0.
+        # Use descending ndc.z so rasterization iterates near-to-far (front-to-back alpha compositing).
         values,point_ids=ndc[:,2].sort(dim=-1,descending=True)
         for i in range(ndc.shape[0]):
             tiles_touched[i]=tiles_touched[i,point_ids[i]]
@@ -665,16 +677,27 @@ class Binning(BaseWrapper):
         # allocate table and fill it (Table: tile_id-uint16,point_id-uint16)
         large_points_index=(tiles_touched>=32).nonzero()
         my_table=litegs_fused.duplicateWithKeys(left_up,right_down,prefix_sum,point_ids,large_points_index,int(allocate_size),img_tile_shape[1])
+
+        '''
+        Example - Before sorting by tile ID:
+        tileId_table: tensor([1014, 1013, 1012, 1011, 1010, 1009, 1008, 1007...], device='cuda:0', dtype=torch.int32)
+        pointId_table: tensor([1489, 1489, 1489, 1489, 1489, 1489, 1489, 1489...], device='cuda:0', dtype=torch.int32)
+        '''
         tileId_table:torch.Tensor=my_table[0]
         pointId_table:torch.Tensor=my_table[1]
 
         # sort tile_id with torch.sort
         sorted_tileId,indices=torch.sort(tileId_table,dim=1,stable=True)
         sorted_pointId=pointId_table.gather(dim=1,index=indices)
+        '''
+        After sorting by tile ID:
+        sorted_tileId: tensor([1, 1, 1, 1, 1, 1, 1, 1...], device='cuda:0', dtype=torch.int32)
+        sorted_pointId: tensor([12529, 12530,  9960, 11940, 11975, 11636, 30885, 30886...], device='cuda:0', dtype=torch.int32)
+        '''
 
         # range
         tile_start_index=litegs_fused.tileRange(sorted_tileId,int(allocate_size),int(tiles_num-1+1))#max_tile_id:tilesnum-1, +1 for offset(tileId 0 is invalid)
-            
+
         return tile_start_index,sorted_pointId,b_visible
     
     
