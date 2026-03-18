@@ -5,6 +5,7 @@ import torch.cuda.nvtx as nvtx
 
 from .. import utils
 from ..utils.statistic_helper import StatisticsHelperInst,StatisticsHelper
+from ..spreading.utils import compute_gaussian_count_per_tile
 from .. import arguments
 from .. import scene
 
@@ -33,7 +34,8 @@ def render_preprocess(cluster_origin:torch.Tensor,cluster_extend:torch.Tensor,fr
 
 def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
            xyz:torch.Tensor,scale:torch.Tensor,rot:torch.Tensor,sh_0:torch.Tensor,sh_rest:torch.Tensor,opacity:torch.Tensor,
-           actived_sh_degree:int,output_shape:tuple[int,int],pp:arguments.PipelineParams)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor]:
+           actived_sh_degree:int,output_shape:tuple[int,int],pp:arguments.PipelineParams,
+           entropy_enabled:bool=False)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,tuple[torch.Tensor,torch.Tensor],tuple[torch.Tensor,torch.Tensor]]:
 
     nvtx.range_push("Activate")
     pad_one=torch.ones((1,xyz.shape[-1]),dtype=xyz.dtype,device=xyz.device)
@@ -71,14 +73,22 @@ def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
     #raster
     tiles_x=int(math.ceil(output_shape[1]/float(pp.tile_size)))
     tiles_y=int(math.ceil(output_shape[0]/float(pp.tile_size)))
-    #tiles=torch.arange(1,tiles_x*tiles_y+1,device=xyz.device,dtype=torch.int32).unsqueeze(0)#0 is invalid
-    img,transmitance,depth,normal=utils.wrapper.GaussiansRasterFunc.apply(sorted_pointId,tile_start_index,ndc_pos,inv_cov2d,color,opacity,None,
-                                            pp.tile_size,output_shape[0],output_shape[1],pp.enable_transmitance,pp.enable_depth)
+    
+    # Calculate gaussian count per tile using helper function
+    gaussian_count_per_tile = compute_gaussian_count_per_tile(tile_start_index)
+
+    img,transmitance,depth,entropy,normal=utils.wrapper.GaussiansRasterFunc.apply(
+        sorted_pointId,tile_start_index,ndc_pos,inv_cov2d,color,opacity,None,
+        pp.tile_size,output_shape[0],output_shape[1],pp.enable_transmitance,pp.enable_depth,entropy_enabled
+    )
+
     img=utils.tiles2img_torch(img,tiles_x,tiles_y)[...,:output_shape[0],:output_shape[1]].contiguous()
     if transmitance is not None:
         transmitance=utils.tiles2img_torch(transmitance,tiles_x,tiles_y)[...,:output_shape[0],:output_shape[1]].contiguous()
     if depth is not None:
         depth=utils.tiles2img_torch(depth,tiles_x,tiles_y)[...,:output_shape[0],:output_shape[1]].contiguous()
+    if entropy is not None:
+        entropy=utils.tiles2img_torch(entropy,tiles_x,tiles_y)[...,:output_shape[0],:output_shape[1]].contiguous()
     if normal is not None:
         normal=utils.tiles2img_torch(normal,tiles_x,tiles_y)[...,:output_shape[0],:output_shape[1]].contiguous()
-    return img,transmitance,depth,normal
+    return img,transmitance,depth,entropy,normal,gaussian_count_per_tile,(scale, opacity)

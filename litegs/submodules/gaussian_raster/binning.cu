@@ -120,6 +120,7 @@ std::vector<at::Tensor> duplicateWithKeys(at::Tensor LU, at::Tensor RD, at::Tens
     CUDA_CHECK_ERRORS;
     
     int large_points_num = large_index.size(0);
+    if (large_points_num > 0) {
     int blocksnum = std::ceil((large_points_num * 32) / 1024.0f);
     large_points_duplicate_with_keys_kernel << <blocksnum, 1024 >> > (
         LU.packed_accessor32<int32_t, 3, torch::RestrictPtrTraits>(),
@@ -131,6 +132,7 @@ std::vector<at::Tensor> duplicateWithKeys(at::Tensor LU, at::Tensor RD, at::Tens
         table_tileId.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
         table_pointId.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>());
     CUDA_CHECK_ERRORS;
+    }
 
     return { table_tileId ,table_pointId };
     
@@ -146,6 +148,37 @@ __global__ void tile_range_kernel(
     int view_id = blockIdx.y;
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
+    // NOTE ABOUT EMPTY TILE GAPS:
+    // This kernel does not produce a fully dense monotonic range table for every tile ID.
+    // It only writes boundary markers at transitions between occupied tiles, so empty tiles
+    // in gaps between occupied tiles can have malformed (start, end) pairs.
+    //
+    // At a transition from occupied tile A to occupied tile B (B > A+1), only
+    // tile_range[A+1] is written into the gap; the rest remain -1. This leaves:
+    //   - tile A+1:       start = valid, end = -1    -> malformed
+    //   - tiles A+2..B-2: start = -1,   end = -1    -> both -1
+    //   - tile B-1:       start = -1,   end = valid  -> malformed
+    //
+    // Concrete example:
+    // - table_tileId = [2, 2, 6, 6]
+    // - total tile count = 9 (valid tile IDs: 1..9, tile 0 is padding/invalid)
+    // - resulting tile_range = [-1, -1, 0, 2, -1, -1, 2, 4, -1, -1, 4]
+    // Per-tile interpretation:
+    // - tile 1: start = -1, end = 0   -> invalid
+    // - tile 2: start = 0,  end = 2   -> valid
+    // - tile 3: start = 2,  end = -1  -> invalid
+    // - tile 4: start = -1, end = -1  -> invalid
+    // - tile 5: start = -1, end = 2   -> invalid
+    // - tile 6: start = 2,  end = 4   -> valid
+    // - tile 7: start = 4,  end = -1  -> invalid
+    // - tile 8: start = -1, end = -1  -> invalid
+    // - tile 9: start = -1, end = 4   -> invalid
+    //
+    // The main raster path in raster.cu is unaffected: the inner loop does not execute
+    // for malformed pairs. Any other consumer must guard with (end >= start >= 0);
+    // tiles passing this check are either occupied (end > start) or single-slot gap
+    // tiles where start == end (count = 0).
+
 
     // head
     if (index == 0)
@@ -158,6 +191,9 @@ __global__ void tile_range_kernel(
     if (index == table_length - 1)
     {
         tile_range[view_id][max_tileId + 1] = table_length;
+        // The fix at tail. See: tile_range_debug.py for details
+        int cur_tile = table_tileId[view_id][index];
+        tile_range[view_id][cur_tile + 1] = table_length;
     }
     
     if (index < table_length-1)
@@ -274,5 +310,3 @@ std::vector<at::Tensor> create_ROI_AABB(at::Tensor ndc, at::Tensor eigen_val, at
     CUDA_CHECK_ERRORS;
     return { left_up ,right_down };
 }
-
-

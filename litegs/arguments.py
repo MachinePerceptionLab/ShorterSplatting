@@ -74,11 +74,15 @@ class PipelineParams(ParamGroup):
     device_preload = True
     enable_transmitance=False
     enable_depth=False
+    # DashGaussian parameters
+    max_n_gaussian = -1
+    max_gaussians_per_tile_at_beginning = 150
     def __init__(self, parser):
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
     iterations = 30000
+    iterations_per_epoch = 200
     position_lr_init = 0.00016
     position_lr_final = 0.0000016
     position_lr_max_steps = 30000
@@ -87,6 +91,8 @@ class OptimizationParams(ParamGroup):
     scaling_lr = 0.005
     rotation_lr = 0.001
     lambda_dssim = 0.2
+    lambda_entropy = 0.0  # Entropy regularization weight
+    scale_reset_factor = 0.0
     def __init__(self, parser):
         super().__init__(parser, "Optimization Parameters")
 
@@ -96,11 +102,11 @@ class DensifyParams(ParamGroup):
     densify_until = -1
     prune_interval = 5
     opacity_reset_interval = 10
-    densify_grad_threshold = 0.00015
+    densify_grad_threshold = 0.0001 # small enough so that we can reach to final count with our new strategies
+    final_gaussian_count = -1
     opacity_threshold=0.005
-    prune_large_point_from=40
+    prune_large_point_from=40  # not used
     screen_size_threshold=128#tile
     percent_dense = 0.01
     def __init__(self, parser):
         super().__init__(parser, "Densify Parameters")
-        

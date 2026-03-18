@@ -14,8 +14,7 @@ namespace cg = cooperative_groups;
 #include "cuda_errchk.h"
 #include "raster.h"
 
-
-template <int tilesize,bool enable_trans,bool enable_depth>
+template <int tilesize,bool enable_trans,bool enable_depth,bool enable_entropy>
 __global__ void raster_forward_kernel(
     const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> sorted_points,    //[batch,tile]  p.s. tile_id 0 is invalid!
     const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> start_index,    //[batch,tile]  p.s. tile_id 0 is invalid!
@@ -27,6 +26,7 @@ __global__ void raster_forward_kernel(
     torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> output_img,    //[batch,3,tile,tilesize,tilesize]
     torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> output_transmitance,    //[batch,1,tile,tilesize,tilesize]
     torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> output_depth,     //[batch,1,tile,tilesize,tilesize]
+    torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> output_entropy,     //[batch,1,tile,tilesize,tilesize]
     torch::PackedTensorAccessor32<int32_t, 4, torch::RestrictPtrTraits> output_last_contributor,    //[batch,tile,tilesize,tilesize]
     int tiles_num_x,int img_h,int img_w
 )
@@ -61,6 +61,7 @@ __global__ void raster_forward_kernel(
         float inv_depth = 0.0f;
         bool done = false;
         float3 final_color{ 0,0,0 };
+        float entropy = 0.0f;
         int last_contributor = 0;
         if (start_index_in_tile != -1)
         {
@@ -118,12 +119,17 @@ __global__ void raster_forward_kernel(
                         continue;
                     }
 
-                    final_color.x += cur_color.x * alpha * transmittance;
-                    final_color.y += cur_color.y * alpha * transmittance;
-                    final_color.z += cur_color.z * alpha * transmittance;
+                    float weight = alpha * transmittance;
+                    final_color.x += cur_color.x * weight;
+                    final_color.y += cur_color.y * weight;
+                    final_color.z += cur_color.z * weight;
                     if (enable_depth)
                     {
-                        inv_depth += collected_depth[i] * alpha * transmittance;
+                        inv_depth += collected_depth[i] * weight;
+                    }
+                    if (enable_entropy && weight > 1e-8f)
+                    {
+                        entropy -= weight * log(weight);
                     }
                     transmittance *= (1 - alpha);
                     last_contributor = offset + i;
@@ -136,20 +142,31 @@ __global__ void raster_forward_kernel(
         output_img[batch_id][0][blockIdx.x][y_in_tile][x_in_tile] = final_color.x;
         output_img[batch_id][1][blockIdx.x][y_in_tile][x_in_tile] = final_color.y;
         output_img[batch_id][2][blockIdx.x][y_in_tile][x_in_tile] = final_color.z;
-        output_transmitance[batch_id][0][blockIdx.x][y_in_tile][x_in_tile] = transmittance;
+        if (enable_trans)
+        {
+            output_transmitance[batch_id][0][blockIdx.x][y_in_tile][x_in_tile] = transmittance;
+        }
         if (enable_depth)
         {
             output_depth[batch_id][0][blockIdx.x][y_in_tile][x_in_tile] = inv_depth;
         }
+        if (enable_entropy)
+        {
+            float weight = transmittance * 0.99f;  // max alpha is 0.99f
+            if (weight > 1e-8f) {
+                entropy -= weight * log(weight);
+            }
+            output_entropy[batch_id][0][blockIdx.x][y_in_tile][x_in_tile] = entropy;
+        }
 
         output_last_contributor[batch_id][blockIdx.x][y_in_tile][x_in_tile] = last_contributor;
-        
     }
 }
 
-#define RASTER_SWITCH_CASE(TILESIZE,TRANS,DEPTH) case ((TILESIZE<<8)+(TRANS<<1)+DEPTH)
-#define FORWARD_CASE_KERNEL(TILESIZE,TRANS,DEPTH) RASTER_SWITCH_CASE(TILESIZE,TRANS,DEPTH):\
-raster_forward_kernel<TILESIZE,TRANS,DEPTH>
+
+#define RASTER_SWITCH_CASE(TILESIZE,TRANS,DEPTH,ENTROPY) case ((TILESIZE<<8)+(TRANS<<2)+(DEPTH<<1)+ENTROPY)
+#define FORWARD_CASE_KERNEL(TILESIZE,TRANS,DEPTH,ENTROPY) RASTER_SWITCH_CASE(TILESIZE,TRANS,DEPTH,ENTROPY):\
+raster_forward_kernel<TILESIZE,TRANS,DEPTH,ENTROPY>
 #define FORWARD_KERNEL_ARGS sorted_points.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),\
 start_index.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),\
 ndc.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),\
@@ -160,6 +177,7 @@ specific_tiles.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),\
 output_img.packed_accessor32<float, 5, torch::RestrictPtrTraits>(),\
 output_transmitance.packed_accessor32<float, 5, torch::RestrictPtrTraits>(),\
 output_depth.packed_accessor32<float, 5, torch::RestrictPtrTraits>(),\
+output_entropy.packed_accessor32<float, 5, torch::RestrictPtrTraits>(),\
 output_last_contributor.packed_accessor32<int32_t, 4, torch::RestrictPtrTraits>(),\
 tilesnum_x, img_h, img_w
 
@@ -176,7 +194,8 @@ std::vector<at::Tensor> rasterize_forward(
     int64_t img_h,
     int64_t img_w,
     bool enable_trans,
-    bool enable_depth
+    bool enable_depth,
+    bool enable_entropy
 )
 {
     at::DeviceGuard guard( ndc.device());
@@ -201,7 +220,11 @@ std::vector<at::Tensor> rasterize_forward(
     at::Tensor output_img = torch::empty({ viewsnum,3, tilesnum,tilesize,tilesize }, opt_img);
 
     torch::TensorOptions opt_t = torch::TensorOptions().dtype(torch::kFloat32).layout(torch::kStrided).device(start_index.device()).requires_grad(enable_trans);
-    at::Tensor output_transmitance = torch::empty({ viewsnum,1, tilesnum, tilesize, tilesize }, opt_t);
+    at::Tensor output_transmitance = torch::empty({ 0,0, 0, 0, 0 }, opt_t);
+    if (enable_trans)
+    {
+        output_transmitance = torch::empty({ viewsnum,1, tilesnum, tilesize, tilesize }, opt_t);
+    }
 
     at::Tensor output_depth = torch::empty({ 0,0, 0, 0, 0 }, opt_t);
     if (enable_depth)
@@ -209,44 +232,64 @@ std::vector<at::Tensor> rasterize_forward(
         output_depth = torch::empty({ viewsnum,1, tilesnum, tilesize, tilesize }, opt_t.requires_grad(true));
     }
 
-    std::vector<int64_t> shape_c{ viewsnum, tilesnum, tilesize, tilesize };
+    at::Tensor output_entropy = torch::empty({ 0,0, 0, 0, 0 }, opt_t);
+    if (enable_entropy)
+    {
+        output_entropy = torch::empty({ viewsnum,1, tilesnum, tilesize, tilesize }, opt_t.requires_grad(true));
+    }
+
     torch::TensorOptions opt_c = torch::TensorOptions().dtype(torch::kInt32).layout(torch::kStrided).device(start_index.device()).requires_grad(false);
+    std::vector<int64_t> shape_c{ viewsnum, tilesnum, tilesize, tilesize };
     at::Tensor output_last_contributor = torch::empty(shape_c, opt_c);
-
-
 
     dim3 Block3d(tilesnum, viewsnum, 1);
     dim3 Thread3d(tilesize, tilesize, 1);
-    int template_code = (tilesize << 8) + (enable_trans << 1) + (enable_depth);
+    int template_code = (tilesize << 8) + (enable_trans << 2) + (enable_depth << 1) + (enable_entropy);
     switch (template_code)
     {
-        FORWARD_CASE_KERNEL(8,true,true) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        FORWARD_CASE_KERNEL(8,true,true,true) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
         break;
-        FORWARD_CASE_KERNEL(8, false, true) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        FORWARD_CASE_KERNEL(8,true,true,false) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
         break;
-        FORWARD_CASE_KERNEL(8, true, false) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        FORWARD_CASE_KERNEL(8,true,false,true) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
         break;
-        FORWARD_CASE_KERNEL(8, false, false) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        FORWARD_CASE_KERNEL(8,true,false,false) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
         break;
-        FORWARD_CASE_KERNEL(16, true, true) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        FORWARD_CASE_KERNEL(8,false,true,true) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
         break;
-        FORWARD_CASE_KERNEL(16, false, true) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        FORWARD_CASE_KERNEL(8,false,true,false) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
         break;
-        FORWARD_CASE_KERNEL(16, true, false) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        FORWARD_CASE_KERNEL(8,false,false,true) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
         break;
-        FORWARD_CASE_KERNEL(16, false, false) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        FORWARD_CASE_KERNEL(8,false,false,false) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        break;
+        FORWARD_CASE_KERNEL(16,true,true,true) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        break;
+        FORWARD_CASE_KERNEL(16,true,true,false) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        break;
+        FORWARD_CASE_KERNEL(16,true,false,true) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        break;
+        FORWARD_CASE_KERNEL(16,true,false,false) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        break;
+        FORWARD_CASE_KERNEL(16,false,true,true) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        break;
+        FORWARD_CASE_KERNEL(16,false,true,false) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        break;
+        FORWARD_CASE_KERNEL(16,false,false,true) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
+        break;
+        FORWARD_CASE_KERNEL(16,false,false,false) << <Block3d, Thread3d >> > (FORWARD_KERNEL_ARGS);
         break;
 
     default:
         assert(false);
 
     }
-    CUDA_CHECK_ERRORS;
-    
-    return { output_img ,output_transmitance,output_depth ,output_last_contributor };
+    CUDA_CHECK_STAGE("forward_raster_kernel");
+
+    return { output_img, output_transmitance, output_depth, output_entropy, output_last_contributor };
 }
 
-template <int tilesize,bool enable_trans_grad,bool enable_depth_grad>
+template <int tilesize,bool enable_trans_grad,bool enable_depth_grad,bool enable_entropy_grad>
 __global__ void raster_backward_kernel_warp_reduction(
     const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> sorted_points,    //[batch,tile]  p.s. tile_id 0 is invalid!
     const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> start_index,    //[batch,tile]  p.s. tile_id 0 is invalid!
@@ -260,6 +303,7 @@ __global__ void raster_backward_kernel_warp_reduction(
     const torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> d_img,    //[batch,3,tile,tilesize,tilesize]
     const torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> d_trans_img,    //[batch,1,tile,tilesize,tilesize]
     const torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> d_depth_img,    //[batch,1,tile,tilesize,tilesize]
+    const torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> d_entropy_img,    //[batch,1,tile,tilesize,tilesize]
     torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> d_ndc,         //[batch,3,point_num]
     torch::PackedTensorAccessor32<float, 4, torch::RestrictPtrTraits> d_cov2d_inv,      //[batch,2,2,point_num]
     torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> d_color,          //[batch,3,point_num]
@@ -483,7 +527,7 @@ __device__ int atomicAggInc(int* ptr)
     return prev;
 }
 
-template <int tilesize,bool enable_trans_grad, bool enable_depth_grad>
+template <int tilesize,bool enable_trans_grad, bool enable_depth_grad, bool enable_entropy_grad>
 __global__ void raster_backward_kernel_multibatch_reduction(
     const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> sorted_points,    //[batch,tile]  p.s. tile_id 0 is invalid!
     const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> start_index,    //[batch,tile]  p.s. tile_id 0 is invalid!
@@ -497,6 +541,7 @@ __global__ void raster_backward_kernel_multibatch_reduction(
     const torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> d_img,    //[batch,3,tile,tilesize,tilesize]
     const torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> d_trans_img,    //[batch,1,tile,tilesize,tilesize]
     const torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> d_depth_img,    //[batch,1,tile,tilesize,tilesize]
+    const torch::PackedTensorAccessor32<float, 5, torch::RestrictPtrTraits> d_entropy_img,    //[batch,1,tile,tilesize,tilesize]
     torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> d_ndc,         //[batch,3,point_num]
     torch::PackedTensorAccessor32<float, 4, torch::RestrictPtrTraits> d_cov2d_inv,      //[batch,2,2,point_num]
     torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> d_color,          //[batch,3,point_num]
@@ -597,6 +642,7 @@ __global__ void raster_backward_kernel_multibatch_reduction(
         float3 d_pixel{ 0,0,0 };
         float d_trans_pixel = 0;
         float d_depth_pixel = 0;
+        float d_entropy_pixel = 0;
         if (pixel_x < img_w && pixel_y < img_h)
         {
             d_pixel.x = d_img[batch_id][0][blockIdx.x][y_in_tile][x_in_tile];
@@ -610,10 +656,20 @@ __global__ void raster_backward_kernel_multibatch_reduction(
             {
                 d_depth_pixel = d_depth_img[batch_id][0][blockIdx.x][y_in_tile][x_in_tile];
             }
+            if (enable_entropy_grad)
+            {
+                d_entropy_pixel = d_entropy_img[batch_id][0][blockIdx.x][y_in_tile][x_in_tile];
+            }
         }
 
         float3 accum_rec{ 0,0,0 };
         float accum_depth = 0;
+        float accum_R = 0.0f; // Accumulator for entropy R term
+
+        // Initialize accum_R with background contribution: R_{N+1} = (log w_{N+1} + 1) * w_{N+1}
+        if (enable_entropy_grad && f_transmittance > 1e-8f) {
+            accum_R = (logf(f_transmittance) + 1.0f) * f_transmittance;
+        }
         for (int offset = end_index_in_tile - 1; offset >= start_index_in_tile; offset -= (tilesize * tilesize ))
         {
             int collected_num = min(tilesize * tilesize , offset - start_index_in_tile + 1);
@@ -685,6 +741,24 @@ __global__ void raster_backward_kernel_multibatch_reduction(
                         d_alpha += (collected_depth[i] - accum_depth) * transmittance * d_depth_pixel;
                         accum_depth = alpha * collected_depth[i] + (1.0f - alpha) * accum_depth;
                     }
+                    if (enable_entropy_grad)
+                    {
+                        float weight = alpha * transmittance;
+
+                        // Only compute gradients for weights that contributed to forward pass
+                        if (weight > 1e-8f) {
+                            // Calculate entropy gradient contribution
+                            float dH_dalpha = (-logf(weight) - 1.0f) * transmittance;
+
+                            // Add R_{i+1} term (accumulated from future gaussians)
+                            dH_dalpha += accum_R / (1.0f - alpha);
+
+                            d_alpha += dH_dalpha * d_entropy_pixel;
+
+                            // Update accum_R for next iteration
+                            accum_R = (logf(weight) + 1.0f) * weight + accum_R;
+                        }
+                    }
 
                     //opacity
                     grad_opacity[shared_mem_offset] = G * d_alpha;
@@ -745,11 +819,11 @@ __global__ void raster_backward_kernel_multibatch_reduction(
 }
 
 
-#define BACKWARD_CASE_MULTIBATCH_KERNEL(TILESIZE,TRANS,DEPTH) RASTER_SWITCH_CASE(TILESIZE,TRANS,DEPTH):\
-raster_backward_kernel_multibatch_reduction<TILESIZE,TRANS,DEPTH>
+#define BACKWARD_CASE_MULTIBATCH_KERNEL(TILESIZE,TRANS,DEPTH,ENTROPY) RASTER_SWITCH_CASE(TILESIZE,TRANS,DEPTH,ENTROPY):\
+raster_backward_kernel_multibatch_reduction<TILESIZE,TRANS,DEPTH,ENTROPY>
 
-#define BACKWARD_CASE_WARP_KERNEL(TILESIZE,TRANS,DEPTH) RASTER_SWITCH_CASE(TILESIZE,TRANS,DEPTH):\
-raster_backward_kernel_warp_reduction<TILESIZE,TRANS,DEPTH>
+#define BACKWARD_CASE_WARP_KERNEL(TILESIZE,TRANS,DEPTH,ENTROPY) RASTER_SWITCH_CASE(TILESIZE,TRANS,DEPTH,ENTROPY):\
+raster_backward_kernel_warp_reduction<TILESIZE,TRANS,DEPTH,ENTROPY>
 
 #define BACKWARD_KERNEL_ARGS sorted_points.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),\
 start_index.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),\
@@ -763,6 +837,7 @@ last_contributor.packed_accessor32<int32_t, 4, torch::RestrictPtrTraits>(),\
 d_img.packed_accessor32<float, 5, torch::RestrictPtrTraits>(),\
 d_trans_img.packed_accessor32<float, 5, torch::RestrictPtrTraits>(),\
 d_depth_img.packed_accessor32<float, 5, torch::RestrictPtrTraits>(),\
+d_entropy_img.packed_accessor32<float, 5, torch::RestrictPtrTraits>(),\
 d_ndc.packed_accessor32<float, 3, torch::RestrictPtrTraits >(),\
 d_cov2d_inv.packed_accessor32<float, 4, torch::RestrictPtrTraits >(),\
 d_color.packed_accessor32<float, 3, torch::RestrictPtrTraits >(),\
@@ -782,6 +857,7 @@ std::vector<at::Tensor> rasterize_backward(
     at::Tensor d_img,
     std::optional<at::Tensor> d_trans_img_arg,
     std::optional<at::Tensor> d_depth_img_arg,
+    std::optional<at::Tensor> d_entropy_img_arg,
     int64_t tilesize,
     int64_t img_h,
     int64_t img_w
@@ -821,6 +897,15 @@ std::vector<at::Tensor> rasterize_backward(
     {
         d_depth_img = torch::empty({ 0,0,0,0,0 }, d_img.options());
     }
+    at::Tensor d_entropy_img;
+    if (d_entropy_img_arg.has_value())
+    {
+        d_entropy_img = *d_entropy_img_arg;
+    }
+    else
+    {
+        d_entropy_img = torch::empty({ 0,0,0,0,0 }, d_img.options());
+    }
 
     at::Tensor d_ndc = torch::zeros_like(ndc, ndc.options());
     at::Tensor d_cov2d_inv = torch::zeros_like(cov2d_inv, ndc.options());
@@ -830,40 +915,59 @@ std::vector<at::Tensor> rasterize_backward(
     dim3 Block3d(tilesnum, viewsnum, 1);
     dim3 Thread3d(tilesize, tilesize, 1);
 
-    cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<8, false, false>, cudaFuncCachePreferShared);
-    cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<8, true, false>, cudaFuncCachePreferShared);
-    cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<8, false, true>, cudaFuncCachePreferShared);
-    cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<8, true, true>, cudaFuncCachePreferShared);
+    cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<8, false, false, false>, cudaFuncCachePreferShared);
+    cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<8, false, false, true>, cudaFuncCachePreferShared);
+    cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<8, true, false, false>, cudaFuncCachePreferShared);
+    cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<8, true, false, true>, cudaFuncCachePreferShared);
+    cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<8, false, true, false>, cudaFuncCachePreferShared);
+    cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<8, false, true, true>, cudaFuncCachePreferShared);
+    cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<8, true, true, false>, cudaFuncCachePreferShared);
+    cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<8, true, true, true>, cudaFuncCachePreferShared);
     /*cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<16, false, false>, cudaFuncCachePreferShared);
     cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<16, true, false>, cudaFuncCachePreferShared);
     cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<16, false, true>, cudaFuncCachePreferShared);
     cudaFuncSetCacheConfig(raster_backward_kernel_multibatch_reduction<16, true, true>, cudaFuncCachePreferShared);*/
 
-    int template_code = (tilesize << 8) + (d_trans_img_arg.has_value() << 1) + (d_depth_img_arg.has_value());
+    int template_code = (tilesize << 8) + (d_trans_img_arg.has_value() << 2) + (d_depth_img_arg.has_value() << 1) + (d_entropy_img_arg.has_value());
     switch (template_code)
     {
-        BACKWARD_CASE_MULTIBATCH_KERNEL(8,true,true) <<<Block3d, Thread3d >>> (BACKWARD_KERNEL_ARGS);
+        BACKWARD_CASE_MULTIBATCH_KERNEL(8,true,true,true) <<<Block3d, Thread3d >>> (BACKWARD_KERNEL_ARGS);
         break;
-        BACKWARD_CASE_MULTIBATCH_KERNEL(8, true, false) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        BACKWARD_CASE_MULTIBATCH_KERNEL(8, true, true, false) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
         break;
-        BACKWARD_CASE_MULTIBATCH_KERNEL(8, false, true) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        BACKWARD_CASE_MULTIBATCH_KERNEL(8, true, false, true) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
         break;
-        BACKWARD_CASE_MULTIBATCH_KERNEL(8, false, false) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        BACKWARD_CASE_MULTIBATCH_KERNEL(8, true, false, false) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
         break;
-        BACKWARD_CASE_WARP_KERNEL(16, true, true) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        BACKWARD_CASE_MULTIBATCH_KERNEL(8, false, true, true) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
         break;
-        BACKWARD_CASE_WARP_KERNEL(16, true, false) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        BACKWARD_CASE_MULTIBATCH_KERNEL(8, false, true, false) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
         break;
-        BACKWARD_CASE_WARP_KERNEL(16, false, true) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        BACKWARD_CASE_MULTIBATCH_KERNEL(8, false, false, true) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
         break;
-        BACKWARD_CASE_WARP_KERNEL(16, false, false) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        BACKWARD_CASE_MULTIBATCH_KERNEL(8, false, false, false) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        break;
+        BACKWARD_CASE_WARP_KERNEL(16, true, true, true) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        break;
+        BACKWARD_CASE_WARP_KERNEL(16, true, true, false) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        break;
+        BACKWARD_CASE_WARP_KERNEL(16, true, false, true) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        break;
+        BACKWARD_CASE_WARP_KERNEL(16, true, false, false) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        break;
+        BACKWARD_CASE_WARP_KERNEL(16, false, true, true) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        break;
+        BACKWARD_CASE_WARP_KERNEL(16, false, true, false) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        break;
+        BACKWARD_CASE_WARP_KERNEL(16, false, false, true) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
+        break;
+        BACKWARD_CASE_WARP_KERNEL(16, false, false, false) << <Block3d, Thread3d >> > (BACKWARD_KERNEL_ARGS);
         break;
     default:
         assert(false);
         ;
     }
     CUDA_CHECK_ERRORS;
-    
+
     return { d_ndc ,d_cov2d_inv ,d_color,d_opacity };
 }
-
