@@ -1,14 +1,30 @@
-# Speeding Up the Learning of 3D Gaussians with Much Shorter Gaussian Lists
+<h1 align="center">Speeding Up the Learning of 3D Gaussians with Much Shorter Gaussian Lists</h1>
 
-Official implementation of **"Speeding Up the Learning of 3D Gaussians with Much Shorter Gaussian Lists"** (CVPR 2026).
+<p align="center"><b>CVPR 2026</b></p>
+
+<p align="center">
+  <a href="https://tail-3lbs.github.io/">Jiaqi Liu</a> &nbsp;|&nbsp;
+  <a href="https://h312h.github.io/">Zhizhong Han</a>
+</p>
+
+<p align="center">Machine Perception Lab, Wayne State University</p>
 
 <p align="center">
   <a href="https://arxiv.org/abs/2603.09277">Paper (arXiv 2603.09277)</a> | <a href="https://machineperceptionlab.github.io/ShorterSplatting-Project/">Project Page</a>
 </p>
 
----
-
 ![Teaser](assets/teaser3.png)
+
+## Table of Contents
+
+- [Method Overview](#method-overview)
+- [Results](#results)
+- [Installation](#installation)
+- [Dataset Preparation](#dataset-preparation)
+- [Evaluation](#evaluation)
+- [Code Changes](#code-changes)
+- [Acknowledgements](#acknowledgements)
+- [BibTeX](#bibtex)
 
 ## Method Overview
 
@@ -99,6 +115,8 @@ Key changes include:
 3. **DashGaussian integration** — incorporating DashGaussian
 
 ## Acknowledgements
+
+This project was partially supported by an NVIDIA academic award and a Richard Barber research award.
 
 We sincerely thank the authors of [LiteGS](https://github.com/MooreThreads/LiteGS), [DashGaussian](https://github.com/YouyuChen0207/DashGaussian), and [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting) for their excellent open-source work, which forms the foundation of this project.
 
