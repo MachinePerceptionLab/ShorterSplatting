@@ -30,7 +30,7 @@
 
 ![Method Overview](assets/overview.png)
 
-Overview of our method and effects. (a) The Gaussian list of 3DGS. (b) Distribution of Gaussian list length showing our method produces significantly shorter lists. (c) Gaussian list reduction after applying scale reset. (d, e) Scale and opacity distributions comparing 3DGS and 3DGS with scale reset, showing scale reset produces smaller Gaussians with higher opacities. (f) Gaussian list reduction after applying entropy regularization. (g, h) Scale and opacity distributions comparing 3DGS and 3DGS with entropy regularization, demonstrating entropy constraint produces smaller Gaussians and more polarized opacities.
+Overview of our method and effects. (a) The Gaussian list of 3DGS. (b) Distribution of Gaussian list length showing our method produces significantly shorter lists. (c) Gaussian list reduction after applying scale reset. (d, e) Scale and opacity distributions comparing 3DGS and 3DGS with scale reset, showing scale reset produces smaller Gaussians with higher opacities. (f) Gaussian list reduction after applying entropy regularization. (g, h) Scale and opacity distributions comparing 3DGS and 3DGS with entropy regularization, demonstrating entropy constraint produces smaller Gaussians and more polarized opacities. "3DGS" results are produced with LiteGS.
 
 ## Results
 
