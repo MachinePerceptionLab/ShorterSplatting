@@ -110,9 +110,9 @@ git diff --compact-summary litegs_stable HEAD -- . ':(exclude)*lanczos*' ':(excl
 
 Key changes include:
 
-1. **Scale reset** — scheduling policy and reset operation
-2. **Entropy regularization** — scheduling policy, loss term, and custom CUDA backward pass
-3. **DashGaussian integration** — incorporating DashGaussian
+1. Scale reset — scheduling policy and reset operation
+2. Entropy regularization — scheduling policy, loss term, and custom CUDA backward pass
+3. DashGaussian integration — incorporating DashGaussian
 
 ## Acknowledgements
 
